@@ -1,203 +1,110 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from enum import Enum
-from pydantic import BaseModel, field_validator
-from typing import Optional
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-app = FastAPI()
-todos_db = []
-id_counter = 0
+app = FastAPI(title="Todo CRUD API")
+ALLOWED_PRIORITIES = ["low", "medium", "high"]
 
 
-class Priority(str, Enum):
-    low = "low"
-    medium = "medium"
-    high = "high"
+class Todo(BaseModel):
+    id: int
+    title: str
+    checked: bool = False
+    priority: str = "medium"
 
 
 class TodoCreate(BaseModel):
-    title: str
+    title: str = Field(..., min_length=3, description="At least 3 characters")
     checked: bool = False
-    priority: Priority
-
-    @field_validator("title")
-    @classmethod
-    def title_must_be_valid(cls, v):
-        if not v or not v.strip():
-            raise ValueError("title must be a non-empty string")
-        if len(v.strip()) < 3:
-            raise ValueError("title must be at least 3 characters long")
-        return v.strip()
-
-    @field_validator("priority", mode="before")
-    @classmethod
-    def priority_must_be_valid(cls, v):
-        allowed = {"low", "medium", "high"}
-        if isinstance(v, str) and v.lower() not in allowed:
-            raise ValueError(f"invalid priority '{v}', must be one of: low, medium, high")
-        return v
+    priority: str = "medium"
 
 
 class TodoUpdate(BaseModel):
-    title: str
-    checked: bool
-    priority: Priority
-
-    @field_validator("title")
-    @classmethod
-    def title_must_be_valid(cls, v):
-        if not v or not v.strip():
-            raise ValueError("title must be a non-empty string")
-        if len(v.strip()) < 3:
-            raise ValueError("title must be at least 3 characters long")
-        return v.strip()
-
-    @field_validator("priority", mode="before")
-    @classmethod
-    def priority_must_be_valid(cls, v):
-        allowed = {"low", "medium", "high"}
-        if isinstance(v, str) and v.lower() not in allowed:
-            raise ValueError(f"invalid priority '{v}', must be one of: low, medium, high")
-        return v
+    title: str = Field(..., min_length=3, description="At least 3 characters")
+    checked: bool = False
+    priority: str = "medium"
 
 
-class TodoPatch(BaseModel):
-    title: Optional[str] = None
-    checked: Optional[bool] = None
-    priority: Optional[Priority] = None
-
-    @field_validator("title")
-    @classmethod
-    def title_must_be_valid(cls, v):
-        if v is not None:
-            if not v or not v.strip():
-                raise ValueError("title must be a non-empty string")
-            if len(v.strip()) < 3:
-                raise ValueError("title must be at least 3 characters long")
-            return v.strip()
-        return v
-
-    @field_validator("priority", mode="before")
-    @classmethod
-    def priority_must_be_valid(cls, v):
-        if v is not None:
-            allowed = {"low", "medium", "high"}
-            if isinstance(v, str) and v.lower() not in allowed:
-                raise ValueError(f"invalid priority '{v}', must be one of: low, medium, high")
-        return v
+todos: List[Todo] = []
 
 
-class TodoResponse(BaseModel):
-    id: int
-    title: str
-    checked: bool
-    priority: Priority
+def find_todo(todo_id: int) -> Optional[Todo]:
+    for todo in todos:
+        if todo.id == todo_id:
+            return todo
+    return None
+
+
+def validate_priority(priority: str):
+    if priority not in ALLOWED_PRIORITIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid priority '{priority}'. Allowed values: {ALLOWED_PRIORITIES}",
+        )
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc):
-    errors = exc.errors()
+async def custom_validation_handler(request: Request, exc: RequestValidationError):
     messages = []
-    for error in errors:
-        field = " -> ".join(str(loc) for loc in error["loc"] if loc != "body")
-        msg = error["msg"]
-        messages.append(f"{field}: {msg}")
+    for error in exc.errors():
+        field = error["loc"][-1]
+        messages.append(f"'{field}': {error['msg']}")
     return JSONResponse(
         status_code=422,
         content={"detail": "Validation failed", "errors": messages},
     )
 
 
-def find_todo(todo_id: int):
-    for index, todo in enumerate(todos_db):
-        if todo["id"] == todo_id:
-            return index, todo
-    return None, None
+@app.get("/todos", response_model=List[Todo])
+def get_todos():
+    return todos
 
 
-@app.post("/todos", status_code=201, response_model=TodoResponse)
-def create_todo(todo: TodoCreate):
-    global id_counter
-    id_counter += 1
-    new_todo = {
-        "id": id_counter,
-        "title": todo.title,
-        "checked": todo.checked,
-        "priority": todo.priority.value,
-    }
-    todos_db.append(new_todo)
-    return new_todo
-
-
-@app.get("/todos", response_model=list[TodoResponse])
-def get_all_todos(priority: Optional[Priority] = None, checked: Optional[bool] = None):
-    filtered = todos_db
-
-    if priority is not None:
-        filtered = [t for t in filtered if t["priority"] == priority.value]
-
-    if checked is not None:
-        filtered = [t for t in filtered if t["checked"] == checked]
-
-    return filtered
-
-
-@app.get("/todos/{todo_id}", response_model=TodoResponse)
+@app.get("/todos/{todo_id}", response_model=Todo)
 def get_todo(todo_id: int):
-    _, todo = find_todo(todo_id)
+    todo = find_todo(todo_id)
     if todo is None:
         raise HTTPException(status_code=404, detail=f"Todo with id {todo_id} not found")
     return todo
 
 
-@app.put("/todos/{todo_id}", response_model=TodoResponse)
-def update_todo(todo_id: int, todo_data: TodoUpdate):
-    index, existing = find_todo(todo_id)
-    if existing is None:
+@app.post("/todos", response_model=Todo, status_code=201)
+def create_todo(todo_in: TodoCreate):
+    validate_priority(todo_in.priority)
+    new_id = max((todo.id for todo in todos), default=0) + 1
+    new_todo = Todo(id=new_id, **todo_in.model_dump())
+    todos.append(new_todo)
+    return new_todo
+
+
+@app.put("/todos/{todo_id}", response_model=Todo)
+def update_todo(todo_id: int, todo_in: TodoUpdate):
+    todo = find_todo(todo_id)
+    if todo is None:
         raise HTTPException(status_code=404, detail=f"Todo with id {todo_id} not found")
 
-    updated = {
-        "id": todo_id,
-        "title": todo_data.title,
-        "checked": todo_data.checked,
-        "priority": todo_data.priority.value,
-    }
-    todos_db[index] = updated
-    return updated
+    validate_priority(todo_in.priority)
+    todo.title = todo_in.title
+    todo.checked = todo_in.checked
+    todo.priority = todo_in.priority
+    return todo
 
 
-@app.patch("/todos/{todo_id}", response_model=TodoResponse)
-def partial_update_todo(todo_id: int, todo_data: TodoPatch):
-    index, existing = find_todo(todo_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"Todo with id {todo_id} not found")
-
-    if todo_data.title is not None:
-        existing["title"] = todo_data.title
-    if todo_data.checked is not None:
-        existing["checked"] = todo_data.checked
-    if todo_data.priority is not None:
-        existing["priority"] = todo_data.priority.value
-
-    todos_db[index] = existing
-    return existing
-
-
-@app.delete("/todos/{todo_id}")
+@app.delete("/todos/{todo_id}", status_code=204)
 def delete_todo(todo_id: int):
-    index, todo = find_todo(todo_id)
+    todo = find_todo(todo_id)
     if todo is None:
         raise HTTPException(status_code=404, detail=f"Todo with id {todo_id} not found")
-    todos_db.pop(index)
-    return {"message": f"Todo with id {todo_id} deleted successfully"}
+    todos.remove(todo)
+    return None
 
 
-@app.patch("/todos/{todo_id}/complete", response_model=TodoResponse)
-def mark_todo_complete(todo_id: int):
-    index, todo = find_todo(todo_id)
+@app.patch("/todos/{todo_id}/complete", response_model=Todo)
+def complete_todo(todo_id: int):
+    todo = find_todo(todo_id)
     if todo is None:
         raise HTTPException(status_code=404, detail=f"Todo with id {todo_id} not found")
-    todo["checked"] = True
-    todos_db[index] = todo
+    todo.checked = True
     return todo
